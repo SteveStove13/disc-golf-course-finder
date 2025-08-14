@@ -1,10 +1,8 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { COURSES } from './data'
 
-// Let TS know about the google global
-declare global {
-  interface Window { google: any }
-}
+// Let TS be ok with Leaflet from a CDN:
+declare const L: any
 
 type Difficulty = 'All' | 'Beginner' | 'Intermediate' | 'Advanced'
 const difficultyOptions: Difficulty[] = ['All', 'Beginner', 'Intermediate', 'Advanced']
@@ -21,208 +19,140 @@ type CourseItem = {
   mapUrl: string
   lat?: number
   lon?: number
-  placeId?: string
 }
 
-// --- Utilities -------------------------------------------------------------
+function bboxAround(lat: number, lon: number, radiusKm = 50) {
+  const d = radiusKm / 111 // ~degrees per 111 km
+  return { south: lat - d, west: lon - d, north: lat + d, east: lon + d }
+}
 
-function loadGoogleMaps(apiKey: string): Promise<void> {
-  if (window.google && window.google.maps) return Promise.resolve()
-  return new Promise((resolve, reject) => {
-    const s = document.createElement('script')
-    s.src = `https://maps.googleapis.com/maps/api/js?key=${apiKey}&libraries=places`
-    s.async = true
-    s.onerror = () => reject(new Error('Failed to load Google Maps'))
-    s.onload = () => resolve()
-    document.head.appendChild(s)
+async function fetchCoursesInBBox(
+  south: number,
+  west: number,
+  north: number,
+  east: number
+): Promise<CourseItem[]> {
+  const overpassUrl = 'https://overpass-api.de/api/interpreter'
+  const query = `
+    [out:json][timeout:25];
+    (
+      nwr["leisure"="disc_golf"](${south},${west},${north},${east});
+    );
+    out center tags;
+  `
+  const res = await fetch(overpassUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'text/plain;charset=UTF-8' },
+    body: query,
+  })
+  if (!res.ok) throw new Error(`Overpass error ${res.status}`)
+
+  const data = await res.json()
+  const elements: any[] = data?.elements ?? []
+
+  const items: CourseItem[] = elements.map((el, idx) => {
+    const lat = el.lat ?? el.center?.lat
+    const lon = el.lon ?? el.center?.lon
+    const name: string = el.tags?.name || 'Disc Golf Course'
+    const city: string =
+      el.tags?.['addr:city'] ||
+      el.tags?.city ||
+      el.tags?.addr_city ||
+      'Unknown'
+    const holesTag = Number(el.tags?.holes)
+
+    return {
+      id: String(el.id ?? idx),
+      name,
+      city,
+      difficulty: 'Intermediate', // neutral default; OSM doesn’t have difficulty
+      rating: 4.5,                 // placeholder
+      holes: Number.isFinite(holesTag) ? holesTag : 18,
+      description: el.tags?.description || 'Disc golf course (OpenStreetMap)',
+      topPick: false,
+      mapUrl:
+        lat && lon
+          ? `https://www.google.com/maps?q=${lat},${lon}`
+          : `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(
+              name + ', ' + city
+            )}`,
+      lat, lon,
+    }
+  })
+
+  // De-dup by name + city
+  const seen = new Set<string>()
+  return items.filter(c => {
+    const key = `${c.name}__${c.city}`
+    if (seen.has(key)) return false
+    seen.add(key)
+    return true
   })
 }
 
-function placeToCourse(p: any, idx: number): CourseItem {
-  const lat = p.geometry?.location?.lat()
-  const lon = p.geometry?.location?.lng()
-  const name = p.name || 'Disc Golf Course'
-  const city = (p.vicinity || p.formatted_address || 'Unknown').toString()
-  const rating = typeof p.rating === 'number' ? p.rating : 4.5
-  const holesGuess = 18 // Places API doesn’t know hole count; sensible default
-  const mapUrl = p.place_id
-    ? `https://www.google.com/maps/place/?q=place_id:${p.place_id}`
-    : (lat && lon ? `https://www.google.com/maps?q=${lat},${lon}` : 'https://maps.google.com')
-
-  return {
-    id: String(p.place_id || idx),
-    name,
-    city,
-    difficulty: 'Intermediate',
-    rating,
-    holes: holesGuess,
-    description: p.types?.includes('park') ? 'Disc golf course / park' : 'Disc golf course',
-    topPick: Boolean(p.user_ratings_total && p.user_ratings_total > 200 && rating >= 4.5),
-    mapUrl,
-    lat, lon,
-    placeId: p.place_id
-  }
+async function geocodePlace(query: string): Promise<{ lat: number; lon: number } | null> {
+  const url = `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(query)}`
+  const res = await fetch(url, { headers: { 'Accept-Language': 'en' } })
+  if (!res.ok) return null
+  const data = await res.json()
+  if (!Array.isArray(data) || data.length === 0) return null
+  return { lat: parseFloat(data[0].lat), lon: parseFloat(data[0].lon) }
 }
-
-function boundsRadiusMeters(map: any) {
-  // approximate radius from map center to NE corner
-  const c = map.getCenter()
-  const ne = map.getBounds().getNorthEast()
-  const R = 6378137
-  const toRad = (x: number) => (x * Math.PI) / 180
-  const dLat = toRad(ne.lat() - c.lat())
-  const dLng = toRad(ne.lng() - c.lng())
-  const a =
-    Math.sin(dLat / 2) ** 2 +
-    Math.cos(toRad(c.lat())) * Math.cos(toRad(ne.lat())) * Math.sin(dLng / 2) ** 2
-  const dist = 2 * R * Math.asin(Math.sqrt(a))
-  return Math.min(Math.max(dist, 500), 50000) // clamp 0.5km..50km (Places NearbySearch limit)
-}
-
-// --- Component -------------------------------------------------------------
 
 export default function App() {
-  // UI
+  // UI filters
   const [query, setQuery] = useState('')
   const [difficulty, setDifficulty] = useState<Difficulty>('All')
   const [onlyTopPicks, setOnlyTopPicks] = useState(false)
   const [sortBy, setSortBy] = useState<'rating' | 'name'>('rating')
 
-  // Dynamic data
+  // Dynamic data + status
   const [dynamicCourses, setDynamicCourses] = useState<CourseItem[] | null>(null)
   const [loading, setLoading] = useState(false)
   const [errorMsg, setErrorMsg] = useState<string | null>(null)
 
-  // Map
+  // Map stuff
   const mapRef = useRef<any>(null)
   const mapElRef = useRef<HTMLDivElement | null>(null)
-  const markersRef = useRef<any[]>([])
+  const markersLayerRef = useRef<any>(null)
+  const [radiusKm, setRadiusKm] = useState<number>(50)
   const [areaText, setAreaText] = useState('')
-  const [radiusChoice, setRadiusChoice] = useState<number>(5000) // m (used for "near me")
 
-  // Init Google Map
+  // Init the Leaflet map
   useEffect(() => {
-    (async () => {
-      try {
-        const apiKey = import.meta.env.VITE_GOOGLE_MAPS_API_KEY as string
-        if (!apiKey) { setErrorMsg('Missing Google Maps API key. Add VITE_GOOGLE_MAPS_API_KEY.'); return }
-        await loadGoogleMaps(apiKey)
-        const center = { lat: 38.627, lng: -90.199 } // St. Louis default
-        const map = new window.google.maps.Map(mapElRef.current!, { center, zoom: 11, mapTypeControl: false })
-        mapRef.current = map
-      } catch (e) {
-        console.error(e); setErrorMsg('Failed to load Google Maps.')
-      }
-    })()
+    if (mapRef.current || !mapElRef.current || typeof L === 'undefined') return
+    const map = L.map(mapElRef.current).setView([38.627, -90.199], 10) // default: St. Louis
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 19,
+      attribution: '&copy; OpenStreetMap contributors',
+    }).addTo(map)
+
+    const markers = L.layerGroup().addTo(map)
+    mapRef.current = map
+    markersLayerRef.current = markers
   }, [])
 
-  // Helpers to manage markers
-  function clearMarkers() { markersRef.current.forEach(m => m.setMap(null)); markersRef.current = [] }
-  function addMarkers(items: CourseItem[]) {
-    if (!mapRef.current) return
+  // Add markers to map when results change
+  useEffect(() => {
     const map = mapRef.current
-    const bounds = new window.google.maps.LatLngBounds()
-    items.forEach((c) => {
+    const layer = markersLayerRef.current
+    if (!map || !layer) return
+    layer.clearLayers()
+    const items = (dynamicCourses && dynamicCourses.length > 0 ? dynamicCourses : COURSES) as any[]
+    const bounds = L.latLngBounds()
+    items.forEach(c => {
       if (!c.lat || !c.lon) return
-      const marker = new window.google.maps.Marker({
-        map,
-        position: { lat: c.lat, lng: c.lon },
-        title: c.name,
-      })
-      const info = new window.google.maps.InfoWindow({
-        content: `<div style="font-weight:600">${c.name}</div><div style="opacity:.8">${c.city}</div>`
-      })
-      marker.addListener('click', () => info.open({ anchor: marker, map }))
-      markersRef.current.push(marker)
-      bounds.extend({ lat: c.lat, lng: c.lon })
+      const m = L.marker([c.lat, c.lon]).bindPopup(`<b>${c.name}</b><br/>${c.city}`)
+      layer.addLayer(m)
+      bounds.extend([c.lat, c.lon])
     })
-    if (!bounds.isEmpty()) map.fitBounds(bounds, 80)
-  }
-
-  async function runNearbySearch(centerLat: number, centerLng: number, radiusMeters: number) {
-    if (!mapRef.current) return
-    setLoading(true); setErrorMsg(null)
-    try {
-      const svc = new window.google.maps.places.PlacesService(mapRef.current)
-      const results: any[] = await new Promise((resolve, reject) => {
-        svc.nearbySearch(
-          { location: { lat: centerLat, lng: centerLng }, radius: radiusMeters, keyword: 'disc golf course' },
-          (res: any[], status: string) => (status === 'OK' || status === 'ZERO_RESULTS') ? resolve(res || []) : reject(status)
-        )
-      })
-      const items = results.map(placeToCourse)
-      setDynamicCourses(items)
-      clearMarkers(); addMarkers(items)
-      mapRef.current.setCenter({ lat: centerLat, lng: centerLng })
-    } catch (e) { console.error(e); setErrorMsg('Places Nearby search failed.') }
-    finally { setLoading(false) }
-  }
-
-  async function runTextSearchInBounds() {
-    if (!mapRef.current) return
-    setLoading(true); setErrorMsg(null)
-    try {
-      const map = mapRef.current
-      const bounds = map.getBounds()
-      const svc = new window.google.maps.places.PlacesService(map)
-      const request: any = { query: 'disc golf course', bounds }
-      const results: any[] = await new Promise((resolve, reject) => {
-        svc.textSearch(request, (res: any[], status: string) =>
-          (status === 'OK' || status === 'ZERO_RESULTS') ? resolve(res || []) : reject(status)
-        )
-      })
-      const items = results.map(placeToCourse)
-      setDynamicCourses(items)
-      clearMarkers(); addMarkers(items)
-    } catch (e) { console.error(e); setErrorMsg('Places Text search failed.') }
-    finally { setLoading(false) }
-  }
-
-  async function geocodeAndSearchArea(text: string) {
-    if (!mapRef.current) return
-    setLoading(true); setErrorMsg(null)
-    try {
-      const geocoder = new window.google.maps.Geocoder()
-      const geo: any = await new Promise((resolve, reject) => {
-        geocoder.geocode({ address: text }, (res: any[], status: string) =>
-          (status === 'OK' && res?.length) ? resolve(res[0]) : reject(status)
-        )
-      })
-      const loc = geo.geometry.location
-      mapRef.current.setCenter(loc)
-      mapRef.current.setZoom(12)
-      const radius = 10000 // 10km default for typed area
-      await runNearbySearch(loc.lat(), loc.lng(), radius)
-    } catch (e) { console.error(e); setErrorMsg('Geocoding failed for that area.') }
-    finally { setLoading(false) }
-  }
-
-  async function loadNearby() {
-    if (!mapRef.current) return
-    setErrorMsg(null)
-    try {
-      const pos = await new Promise<GeolocationPosition>((resolve, reject) => {
-        if (!navigator.geolocation) return reject(new Error('Geolocation not available'))
-        navigator.geolocation.getCurrentPosition(resolve, reject, { enableHighAccuracy: true, timeout: 10000 })
-      })
-      const { latitude, longitude } = pos.coords
-      mapRef.current.setCenter({ lat: latitude, lng: longitude })
-      mapRef.current.setZoom(12)
-      await runNearbySearch(latitude, longitude, radiusChoice)
-    } catch (e) {
-      console.error(e); setErrorMsg('Could not get your location.')
+    if (items.some(c => c.lat && c.lon)) {
+      map.fitBounds(bounds.pad(0.2))
     }
-  }
+  }, [dynamicCourses])
 
-  async function searchThisMap() {
-    if (!mapRef.current) return
-    const r = boundsRadiusMeters(mapRef.current)
-    const c = mapRef.current.getCenter()
-    await runNearbySearch(c.lat(), c.lng(), r)
-  }
-
-  // Use dynamic results or static fallback
-  const sourceCourses: any[] = dynamicCourses && dynamicCourses.length > 0 ? dynamicCourses : (COURSES as any[])
+  const sourceCourses: any[] =
+    dynamicCourses && dynamicCourses.length > 0 ? dynamicCourses : (COURSES as any[])
 
   const results = useMemo(() => {
     let items = sourceCourses.filter((c: any) => {
@@ -235,27 +165,95 @@ export default function App() {
     return items
   }, [query, difficulty, onlyTopPicks, sortBy, sourceCourses])
 
+  async function loadNearby() {
+    setErrorMsg(null)
+    setLoading(true)
+    try {
+      const pos = await new Promise<GeolocationPosition>((resolve, reject) => {
+        if (!navigator.geolocation) return reject(new Error('Geolocation not available'))
+        navigator.geolocation.getCurrentPosition(resolve, reject, { enableHighAccuracy: true, timeout: 10000 })
+      })
+      const { latitude, longitude } = pos.coords
+      const bbox = bboxAround(latitude, longitude, radiusKm)
+      const items = await fetchCoursesInBBox(bbox.south, bbox.west, bbox.north, bbox.east)
+      setDynamicCourses(items)
+      // Pan/zoom map
+      if (mapRef.current) mapRef.current.setView([latitude, longitude], 11)
+    } catch (e) {
+      console.error(e)
+      setErrorMsg('Could not get your location. Try "Search this area" instead.')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  async function searchArea() {
+    setErrorMsg(null)
+    if (!areaText.trim()) {
+      setErrorMsg('Type a city or area first.')
+      return
+    }
+    setLoading(true)
+    try {
+      const loc = await geocodePlace(areaText.trim())
+      if (!loc) {
+        setErrorMsg('Area not found. Try a more specific name.')
+        setLoading(false)
+        return
+      }
+      const bbox = bboxAround(loc.lat, loc.lon, radiusKm)
+      const items = await fetchCoursesInBBox(bbox.south, bbox.west, bbox.north, bbox.east)
+      setDynamicCourses(items)
+      if (mapRef.current) mapRef.current.setView([loc.lat, loc.lon], 11)
+    } catch (e) {
+      console.error(e)
+      setErrorMsg('Could not load that area right now.')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  async function searchThisMap() {
+    setErrorMsg(null)
+    const map = mapRef.current
+    if (!map) return
+    setLoading(true)
+    try {
+      const b = map.getBounds()
+      const south = b.getSouth()
+      const west = b.getWest()
+      const north = b.getNorth()
+      const east = b.getEast()
+      const items = await fetchCoursesInBBox(south, west, north, east)
+      setDynamicCourses(items)
+    } catch (e) {
+      console.error(e)
+      setErrorMsg('Could not load courses for this map view.')
+    } finally {
+      setLoading(false)
+    }
+  }
+
   return (
     <div className="min-h-screen bg-lightBg dark:bg-darkBg text-darkBg dark:text-lightBg">
       <header className="sticky top-0 z-10 bg-primary text-white border-b border-white/10">
         <div className="max-w-6xl mx-auto px-4 py-4 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
           <div>
             <h1 className="text-2xl sm:text-3xl font-extrabold tracking-tight">Disc Golf Course Finder</h1>
-            <p className="text-sm text-white/80">Google Maps + Places — find courses near you or in any area.</p>
+            <p className="text-sm text-white/80">Load nearby courses or search an area — live from OpenStreetMap.</p>
           </div>
 
           <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2 w-full sm:w-auto">
             <div className="flex items-center gap-2">
               <select
-                value={radiusChoice}
-                onChange={(e) => setRadiusChoice(Number(e.target.value))}
+                value={radiusKm}
+                onChange={(e) => setRadiusKm(Number(e.target.value))}
                 className="rounded-xl border border-white/20 bg-white/10 px-2 py-2 text-sm"
-                title="Nearby radius"
+                title="Search radius"
               >
-                <option value={2000}>2 km</option>
-                <option value={5000}>5 km</option>
-                <option value={10000}>10 km</option>
-                <option value={20000}>20 km</option>
+                <option value={25}>25 km</option>
+                <option value={50}>50 km</option>
+                <option value={100}>100 km</option>
               </select>
 
               <button
@@ -271,11 +269,11 @@ export default function App() {
               <input
                 value={areaText}
                 onChange={(e) => setAreaText(e.target.value)}
-                placeholder="City / area (e.g., Kansas City, MO)"
+                placeholder="City / area (e.g., St. Louis, MO)"
                 className="rounded-xl border border-white/20 bg-white/10 px-3 py-2 text-sm placeholder-white/70"
               />
               <button
-                onClick={() => geocodeAndSearchArea(areaText)}
+                onClick={searchArea}
                 className="inline-flex items-center rounded-xl border border-white/20 px-3 py-2 text-sm bg-white/10 hover:bg-white/20 transition disabled:opacity-50"
                 disabled={loading}
               >
@@ -295,7 +293,7 @@ export default function App() {
       </header>
 
       <main className="max-w-6xl mx-auto px-4 py-6 grid grid-cols-1 lg:grid-cols-12 gap-6">
-        {/* Left: filters + results */}
+        {/* Left column: filters + list */}
         <aside className="lg:col-span-4 space-y-4">
           <div className="bg-white/70 dark:bg-black/20 backdrop-blur rounded-2xl shadow p-4 border border-primary/20">
             <h2 className="font-semibold mb-3">Filter results</h2>
@@ -333,7 +331,18 @@ export default function App() {
               />
               Only show Top Picks
             </label>
-            {errorMsg && <p className="text-sm text-red-600">{errorMsg}</p>}
+          </div>
+
+          <div className="bg-white/70 dark:bg-black/20 backdrop-blur rounded-2xl shadow p-4 border border-primary/20">
+            <h2 className="font-semibold mb-2">Sort</h2>
+            <select
+              value={sortBy}
+              onChange={(e) => setSortBy(e.target.value as any)}
+              className="w-full rounded-xl border border-primary/30 bg-lightBg dark:bg-darkBg text-inherit px-3 py-2"
+            >
+              <option value="rating">Rating (High → Low)</option>
+              <option value="name">Name (A → Z)</option>
+            </select>
           </div>
 
           <section className="space-y-4">
@@ -347,7 +356,7 @@ export default function App() {
           </section>
         </aside>
 
-        {/* Right: Google map */}
+        {/* Right column: map */}
         <section className="lg:col-span-8 space-y-4">
           <div
             ref={mapElRef}
@@ -355,10 +364,22 @@ export default function App() {
             id="map"
           />
           <div className="rounded-2xl border border-primary/20 p-4 text-xs opacity-80">
-            <p>Pan/zoom the map and click <strong>Search this map</strong>, or type a city and click <strong>Search this area</strong>.</p>
+            <p>
+              Tip: pan/zoom the map, then click <strong>Search this map</strong>. Or type a city and
+              <strong> Search this area</strong>.
+            </p>
           </div>
         </section>
       </main>
+
+      <footer className="max-w-6xl mx-auto px-4 pb-12">
+        <div className="rounded-2xl border border-primary/20 p-6">
+          <h2 className="text-xl font-semibold mb-2">How it works</h2>
+          <p className="text-sm opacity-80">
+            We query public disc golf courses from OpenStreetMap via Overpass. Some attributes like ratings/holes may be missing.
+          </p>
+        </div>
+      </footer>
     </div>
   )
 }
